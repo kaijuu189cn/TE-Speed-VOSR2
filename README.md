@@ -1,14 +1,16 @@
-# TE-Speed-VOSR2 1.0
+# TE-Speed-VOSR2
 
-VOSR2 图片与视频超分辨率放大 ComfyUI 节点，使用多项加速策略，对VOSR2在comfyui中的使用极致加速。为 [VOSR](https://github.com/cswry/VOSR) 加入分块推理、显存调度、视频处理优化和 SageAttention。
+VOSR2 图片与视频超分辨率放大 ComfyUI 节点。
 
+- **Windows**: 使用编译的 .pyd（原始 C++ 实现，多加速策略）
+- **Linux**: 使用纯 Python `nodes_linux.py`（等效算法，自动回退）
+
+两种实现注册相同的节点 ID（TESpeedVOSR2Loader、TESpeedVOSR2Settings、TESpeedVOSR2Image、TESpeedVOSR2Video），工作流无需改线即可跨平台使用。
 
 模型下载：
 https://pan.quark.cn/s/88fc2eeced6f
 
-
-
-## 1.0
+## 功能
 
 - 支持 VOSR 2.0 1.4B one-step 模型。
 - 支持图片原尺寸修复与整数倍放大。
@@ -19,11 +21,19 @@ https://pan.quark.cn/s/88fc2eeced6f
 - 自动使用 ComfyUI 的 SageAttention，未安装时回退到 SDPA。
 - 支持可选 `torch.compile`，运行失败时自动回退到 eager 模式。
 
+## 跨平台说明
+
+| 文件 | 平台 | 说明 |
+|---|---|---|
+| `nodes.pyd` + `settings.pyd` + `inference.pyd` + `model_store.pyd` | Windows | 原始编译实现 |
+| `nodes_linux.py` | Linux | 纯 Python 兼容壳，复用 `backend/` 中的模型代码 |
+| `__init__.py` | 自动 | 自动检测平台，优先尝试 .pyd，失败则回退到 .py |
+
 ## 环境要求
 
-- Windows x64
+- Windows x64 或 Linux x64 (ROCm/CUDA)
 - ComfyUI
-- NVIDIA GPU
+- GPU（NVIDIA / AMD）
 - Python 3.12 或 Python 3.13 环境
 - PyTorch 与 CUDA 版本需要和当前 ComfyUI 环境兼容
 - 可选：SageAttention；ComfyUI 能正常识别即可，无需在节点中单独选择
