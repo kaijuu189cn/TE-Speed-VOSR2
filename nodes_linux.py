@@ -1,309 +1,311 @@
-"""TESpeedVOSR2* Linux 兼容壳。
+"""ComfyUI nodes for TE-Speed-VOSR2.
 
-注册节点 ID 与 Windows .pyd 原版完全一致（TESpeedVOSR2Loader,
-TESpeedVOSR2Settings, TESpeedVOSR2Image, TESpeedVOSR2Video），
-工作流无需改线。
-
-底层加载 backend/ 中的模型（DINOv2、VAE、DiT）并调用 vosr2_upscale_one_step
-完成实际的上采样。自定义类型映射：
-
-  TE_SPEED_VOSR2_SETTINGS  → dict（settings 参数字典）
-  TE_SPEED_VOSR2_MODEL     → dict（bundle，与 VOSR2_BUNDLE 同一结构）
+Reconstructed from the Cython-compiled `nodes.pyd` via static analysis.
 """
 
-import sys
-import os
+from __future__ import annotations
+
 import logging
-import math
+from typing import Any, Optional
 
 import torch
-import torch.nn.functional as F
-import numpy as np
-from PIL import Image
 
-import comfy
-import comfy.model_management as mm
-import folder_paths
+from . import model_store, inference
+from .model_store import VOSR2LoadError, bundle_names
+from .settings import VOSR2Settings
 
-logger = logging.getLogger("TESpeedVOSR2-Linux")
+log = logging.getLogger("TE-Speed-VOSR2")
 
-# ── Import vendored models from backend/ ─────────────────────────
-_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-_BACKEND_DIR = os.path.join(_PLUGIN_DIR, "backend")
-if _BACKEND_DIR not in sys.path:
-    sys.path.insert(0, _BACKEND_DIR)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-from models.dinov2 import build_dinov2_vitl14
-from models.qwenimage_vae2d import AutoencoderKLQwenImage2D
-from models.lightningdit import LightningDiT
-from color import apply_color_alignment
-
-AE_FACTOR = 8  # Qwen VAE spatial compression ratio
-PATCH_SIZE = 2
-
-VOSR2_MODEL_DIR = os.path.join(folder_paths.models_dir, "vosr2", "VOSR2")
+DEFAULT_BUNDLE: str = "VOSR2"
 
 
-# ── Loading helpers ──────────────────────────────────────────────
-
-def load_dinov2(device):
-    ckpt = os.path.join(VOSR2_MODEL_DIR, "dinov2_vitl14.safetensors")
-    if not os.path.exists(ckpt):
-        alt = os.path.join(VOSR2_MODEL_DIR, "dinov2_vitl14_pretrain.pth")
-        if os.path.exists(alt):
-            ckpt = alt
-    if not os.path.exists(ckpt):
-        raise FileNotFoundError(f"DINOv2 checkpoint not found: {ckpt}")
-    logger.info(f"  DINOv2: {ckpt}")
-    model = build_dinov2_vitl14()
-    sd = comfy.utils.load_torch_file(ckpt, safe_load=True)
-    model.load_state_dict(sd, strict=True)
-    model.to(device).eval()
-    return model
+def _get_device_type() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
-def load_vae(device):
-    vae_dir = os.path.join(VOSR2_MODEL_DIR, "Qwen-Image-vae-2d")
-    cfg_path = os.path.join(vae_dir, "config.json")
-    if not os.path.exists(cfg_path):
-        raise FileNotFoundError(f"VAE config not found: {cfg_path}")
-    import json
-    with open(cfg_path) as f:
-        vae_config = json.load(f)
-    vae = AutoencoderKLQwenImage2D(**vae_config)
-    ckpt = os.path.join(vae_dir, "diffusion_pytorch_model.safetensors")
-    sd = comfy.utils.load_torch_file(ckpt, safe_load=True)
-    vae.load_state_dict(sd, strict=True)
-    vae.to(device).eval()
-    return vae
+def _resolve_bundle_path(bundle: str) -> str:
+    import folder_paths
+    models_dir = folder_paths.get_folder_paths("vosr2")[0] \
+        if hasattr(folder_paths, "get_folder_paths") else \
+        folder_paths.models_dir
+    return str(model_store._bundle_path(models_dir, bundle))
 
 
-def load_dit(device):
-    ckpt_dir = os.path.join(VOSR2_MODEL_DIR, "checkpoints")
-    ckpt = os.path.join(ckpt_dir, "ema_model.safetensors")
-    args_file = os.path.join(VOSR2_MODEL_DIR, "args.json")
-    if not os.path.exists(args_file):
-        raise FileNotFoundError(f"DiT args not found: {args_file}")
-    import json
-    with open(args_file) as f:
-        dit_args = json.load(f)
+# ---------------------------------------------------------------------------
+# NODE CLASS MAPPINGS
+# ---------------------------------------------------------------------------
 
-    # Build DiT model
-    in_channels = dit_args.get("in_channels", 4)
-    model = LightningDiT(
-        input_size=None,
-        in_channels=in_channels,
-        dit_args=dit_args,
-    )
-    sd = comfy.utils.load_torch_file(ckpt, safe_load=True)
-    model.load_state_dict(sd, strict=True)
-    model.to(device).eval()
-    return model, dit_args
+NODE_CLASS_MAPPINGS: dict[str, type] = {}
+NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {}
+
+# ---------------------------------------------------------------------------
+# TESpeedVOSR2Loader
+# ---------------------------------------------------------------------------
 
 
-def _nearest_multiple(x, m):
-    return int(math.ceil(x / m) * m)
-
-
-def vosr2_upscale_one_step(image_bchw, scale, dinov2, vae, dit, dit_args, device,
-                            color_alignment="wavelet"):
-    """Single-step VOSR2 upscale.
-
-    Args:
-        image_bchw: (1, C, H, W) float32 tensor on device
-        scale: int (1, 2, 3, 4)
-    """
-    B, C, H, W = image_bchw.shape
-    logger.info(f"  Input: {image_bchw.shape}, scale={scale}")
-
-    # 1. Encode to latent
-    ae_factor = AE_FACTOR
-    h_ae = _nearest_multiple(H, ae_factor)
-    w_ae = _nearest_multiple(W, ae_factor)
-    img_pad = F.pad(image_bchw, (0, w_ae - W, 0, h_ae - H))
-    latents = vae.encode(img_pad).latent_dist.sample()
-    logger.info(f"  Latent: {latents.shape}")
-
-    # 2. Upsample latent
-    h_lat = latents.shape[2] * scale
-    w_lat = latents.shape[3] * scale
-    latents = F.interpolate(latents, size=(h_lat, w_lat), mode="bilinear", align_corners=False)
-
-    # 3. DINOv2 features
-    img_dino = F.interpolate(image_bchw, size=(224, 224), mode="bilinear", align_corners=False)
-    with torch.no_grad():
-        feats = dinov2.forward_features(img_dino)
-        dino_feat = feats["x_norm_patchtokens"]
-    logger.info(f"  DINO features: {dino_feat.shape}")
-
-    # 4. DiT inference
-    t = torch.zeros((B,), device=device)
-    with torch.no_grad():
-        pred = dit(latents, t, encoder_hidden_states=dino_feat)
-        pred = pred.sample.to(device)
-    logger.info(f"  DiT output: {pred.shape}")
-
-    # 5. Decode
-    h_out = pred.shape[2] * ae_factor
-    w_out = pred.shape[3] * ae_factor
-    pred_up = F.interpolate(pred, size=(h_out, w_out), mode="bilinear", align_corners=False)
-    out = vae.decode(pred_up).sample
-    logger.info(f"  VAE decode: {out.shape}")
-
-    # 6. Crop and color align
-    out = out[:, :, :H * scale, :W * scale]
-    if color_alignment != "none":
-        out = apply_color_alignment(out, image_bchw, mode=color_alignment)
-
-    out = out.clamp(0, 1)
-    return out
-
-
-# ── TESpeedVOSR2Settings ─────────────────────────────────────────
-class TESpeedVOSR2Settings:
-    CATEGORY = "VOSR2"
-    FUNCTION = "get_settings"
-    RETURN_TYPES = ("TE_SPEED_VOSR2_SETTINGS",)
-    RETURN_NAMES = ("settings",)
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "quality_profile": (["speed", "balanced", "quality"], {"default": "speed"}),
-                "tile_strategy": (["auto", "even", "overlap"], {"default": "auto"}),
-                "tile_size": ("INT", {"default": 512, "min": 128, "max": 2048, "step": 64}),
-                "tile_overlap": ("INT", {"default": 32, "min": 0, "max": 256, "step": 8}),
-                "vae_tile_size": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 64}),
-                "vae_tile_overlap": ("INT", {"default": 32, "min": 0, "max": 256, "step": 8}),
-                "image_batch": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
-                "frame_batch": ("INT", {"default": 2, "min": 1, "max": 64, "step": 1}),
-                "dino_batch": ("INT", {"default": 2, "min": 1, "max": 64, "step": 1}),
-                "temporal_cache": ("BOOLEAN", {"default": False}),
-                "cache_threshold": ("FLOAT", {"default": 0.003, "min": 0.0, "max": 1.0, "step": 0.001}),
-                "cache_refresh": ("INT", {"default": 4, "min": 1, "max": 64, "step": 1}),
-                "memory_policy": (["auto", "low", "high"], {"default": "auto"}),
-                "color_alignment": (["wavelet", "adain", "none"], {"default": "wavelet"}),
-            }
-        }
-
-    def get_settings(self, **kwargs):
-        return (dict(kwargs),)
-
-
-# ── TESpeedVOSR2Loader ───────────────────────────────────────────
 class TESpeedVOSR2Loader:
-    CATEGORY = "VOSR2"
-    FUNCTION = "load"
+    """Load VOSR2 model bundle from disk."""
+
+    CATEGORY = "TE-Speed/VOSR2"
     RETURN_TYPES = ("TE_SPEED_VOSR2_MODEL",)
-    RETURN_NAMES = ("model",)
+    RETURN_NAMES = ("model_bundle",)
+    FUNCTION = "load"
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls) -> dict:
         return {
             "required": {
                 "model_bundle": (["VOSR2"], {"default": "VOSR2"}),
-                "precision": (["auto", "fp32"], {"default": "auto"}),
-                "memory_policy": (["auto", "low", "high"], {"default": "auto"}),
+                "torch_compile": ("BOOLEAN", {"default": False}),
+                "vae_encode_amp": ("BOOLEAN", {"default": True}),
+                "precision": (["fp16", "bf16", "float32"], {"default": "fp16"}),
+            }
+        }
+
+    def load(self, model_bundle: str, torch_compile: bool = False,
+             vae_encode_amp: bool = True, precision: str = "fp16",
+             **kwargs) -> tuple[model_store.TESpeedVOSR2Model]:
+        """Load the model bundle and return it."""
+        import folder_paths
+
+        models_root = folder_paths.get_folder_paths("vosr2")[0] \
+            if folder_paths.folder_names_and_paths.get("vosr2") else \
+            str(folder_paths.models_dir)
+
+        bundle_dir = model_store._bundle_path(models_root, model_bundle)
+
+        if precision == "fp16":
+            dtype = torch.float16
+        elif precision == "bf16":
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float32
+
+        cache_root = None
+        try:
+            cache_root = folder_paths.get_folder_paths("vosr2_cache")[0]
+        except Exception:
+            pass
+
+        m = model_store.TESpeedVOSR2Model(
+            bundle_dir=str(bundle_dir),
+            device=torch.device(_get_device_type()),
+            dtype=dtype,
+            vae_encode_amp=vae_encode_amp,
+            cache_root=cache_root,
+        )
+
+        if torch_compile:
+            m.set_torch_compile(True)
+
+        return (m,)
+
+
+NODE_CLASS_MAPPINGS["TESpeedVOSR2Loader"] = TESpeedVOSR2Loader
+NODE_DISPLAY_NAME_MAPPINGS["TESpeedVOSR2Loader"] = "TE-Speed VOSR2 Loader"
+
+# ---------------------------------------------------------------------------
+# TESpeedVOSR2Settings
+# ---------------------------------------------------------------------------
+
+
+class TESpeedVOSR2Settings:
+    """Create VOSR2 inference settings."""
+
+    CATEGORY = "TE-Speed/VOSR2"
+    RETURN_TYPES = ("TE_SPEED_VOSR2_SETTINGS",)
+    RETURN_NAMES = ("settings",)
+    FUNCTION = "make"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        return {
+            "required": {
+                "quality_profile": (["speed", "manual"], {"default": "speed"}),
+                "tile_size": ("INT", {"default": 512, "min": 64, "max": 8192, "step": 64}),
+                "tile_overlap": ("INT", {"default": 64, "min": 8, "max": 1024, "step": 8}),
+                "tile_strategy": (["auto", "tiled", "balanced"], {"default": "auto"}),
+                "vae_tile_size": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 64}),
+                "vae_tile_overlap": ("INT", {"default": 128, "min": 8, "max": 1024, "step": 8}),
+                "memory_policy": (["resident", "staged", "auto"], {"default": "resident"}),
+                "image_batch": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
+                "frame_batch": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
+                "dino_batch": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
+                "color_alignment": (["none", "adain", "wavelet"], {"default": "wavelet"}),
+                "full_frame": ("BOOLEAN", {"default": False}),
+                "temporal_cache": ("BOOLEAN", {"default": True}),
+                "cache_refresh": ("INT", {"default": 16, "min": 1, "max": 256, "step": 1}),
+                "cache_threshold": ("FLOAT", {"default": 0.7, "min": 0.05, "max": 0.95, "step": 0.05}),
+            }
+        }
+
+    def make(self, **kwargs) -> tuple[VOSR2Settings]:
+        """Create and return a VOSR2Settings dataclass."""
+        # Map param names to VOSR2Settings field names
+        s = VOSR2Settings(
+            quality_profile=kwargs.get("quality_profile", "speed"),
+            tile_size=kwargs.get("tile_size", 512),
+            tile_overlap=kwargs.get("tile_overlap", 64),
+            tile_strategy=kwargs.get("tile_strategy", "auto"),
+            vae_tile_size=kwargs.get("vae_tile_size", 1024),
+            vae_tile_overlap=kwargs.get("vae_tile_overlap", 128),
+            memory_policy=kwargs.get("memory_policy", "resident"),
+            image_batch=kwargs.get("image_batch", 1),
+            frame_batch=kwargs.get("frame_batch", 1),
+            dino_batch=kwargs.get("dino_batch", 1),
+            color_alignment=kwargs.get("color_alignment", "wavelet"),
+            full_frame=kwargs.get("full_frame", False),
+            temporal_cache=kwargs.get("temporal_cache", True),
+            cache_refresh=kwargs.get("cache_refresh", 16),
+            cache_threshold=kwargs.get("cache_threshold", 0.7),
+        )
+        return (s,)
+
+
+NODE_CLASS_MAPPINGS["TESpeedVOSR2Settings"] = TESpeedVOSR2Settings
+NODE_DISPLAY_NAME_MAPPINGS["TESpeedVOSR2Settings"] = "TE-Speed VOSR2 Settings"
+
+# ---------------------------------------------------------------------------
+# _VOSR2Base
+# ---------------------------------------------------------------------------
+
+
+class _VOSR2Base:
+    """Base class for VOSR2 inference nodes."""
+
+    CATEGORY = "TE-Speed/VOSR2"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "upscale"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        return {
+            "required": {
+                "model": ("TE_SPEED_VOSR2_MODEL",),
+                "settings": ("TE_SPEED_VOSR2_SETTINGS",),
+                "images": ("IMAGE",),
+                "scale": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 8.0, "step": 0.25}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 2**32 - 1}),
             },
             "optional": {
-                "torch_compile": ("BOOLEAN", {"default": False}),
-                "vae_encode_amp": ("BOOLEAN", {"default": False}),
-            }
+                "noise_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+            },
         }
 
-    def load(self, model_bundle="VOSR2", precision="auto", memory_policy="auto",
-             torch_compile=False, vae_encode_amp=False):
-        device = mm.get_torch_device()
-        logger.info(f"Loading VOSR2 on {device} (fp32)")
-        d2 = load_dinov2(device)
-        vae = load_vae(device)
-        dit, args = load_dit(device)
-        mm.soft_empty_cache()
-        return ({"device": device, "dinov2": d2, "vae": vae, "dit": dit, "args": args},)
+    def upscale(self, model: model_store.TESpeedVOSR2Model,
+                settings: VOSR2Settings, images: torch.Tensor,
+                scale: float = 1.0, seed: int = 0,
+                noise_scale: float = 1.0,
+                **kwargs) -> tuple[torch.Tensor]:
+        """Run VOSR2 inference and return upscaled images."""
+        n = settings.normalized()
 
+        # Apply memory policy
+        model.set_memory_policy(n.memory_policy)
 
-# ── TESpeedVOSR2Image ────────────────────────────────────────────
-class TESpeedVOSR2Image:
-    CATEGORY = "VOSR2"
-    FUNCTION = "upscale"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+        # Set torch compile if requested
+        if model._compile_requested:
+            model.set_torch_compile(True)
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("TE_SPEED_VOSR2_MODEL",),
-                "images": ("IMAGE",),
-                "settings": ("TE_SPEED_VOSR2_SETTINGS",),
-                "scale": ("INT", {"default": 2, "min": 1, "max": 4, "step": 1}),
-                "seed": ("INT", {"default": 666, "min": 0, "max": 0xFFFFFFFF, "step": 1}),
-            }
-        }
-
-    def upscale(self, model, images, settings, scale, seed):
-        torch.manual_seed(seed)
-        device = model["device"]
-        img = images[0:1].permute(0, 3, 1, 2).contiguous().to(device, torch.float32)
-        logger.info(f"Input: {img.shape}")
-        color_alignment = settings.get("color_alignment", "wavelet")
-        result = vosr2_upscale_one_step(
-            img, scale, model["dinov2"], model["vae"], model["dit"],
-            model["args"], device, color_alignment
+        output, _ = inference.run_vosr2(
+            model=model,
+            images=images,
+            settings=settings,
+            scale=scale,
+            seed=seed,
+            noise_scale=noise_scale,
+            dino_features=None,
+            enable_timing=False,
         )
-        result = result.permute(0, 2, 3, 1).cpu().to(torch.float32)
-        mm.soft_empty_cache()
-        return (result,)
+        return (output,)
 
 
-# ── TESpeedVOSR2Video ────────────────────────────────────────────
-class TESpeedVOSR2Video:
-    CATEGORY = "VOSR2"
-    FUNCTION = "upscale"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+# ---------------------------------------------------------------------------
+# TESpeedVOSR2Image
+# ---------------------------------------------------------------------------
+
+
+class TESpeedVOSR2Image(_VOSR2Base):
+    """Upscale a single image or image batch with VOSR2."""
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("TE_SPEED_VOSR2_MODEL",),
-                "images": ("IMAGE",),
-                "settings": ("TE_SPEED_VOSR2_SETTINGS",),
-                "scale": ("INT", {"default": 2, "min": 1, "max": 4, "step": 1}),
-                "seed": ("INT", {"default": 666, "min": 0, "max": 0xFFFFFFFF, "step": 1}),
-            }
-        }
+    def INPUT_TYPES(cls) -> dict:
+        parent = super().INPUT_TYPES()
+        parent["optional"]["auto_expand_vae_tile"] = ("BOOLEAN", {"default": True})
+        parent["optional"]["batch_override"] = ("INT", {"default": 0, "min": 0, "max": 64, "step": 1})
+        return parent
 
-    def upscale(self, model, images, settings, scale, seed):
-        torch.manual_seed(seed)
-        device = model["device"]
-        color_alignment = settings.get("color_alignment", "wavelet")
-        B = images.shape[0]
-        frames_out = []
-        for i in range(B):
-            img = images[i:i+1].permute(0, 3, 1, 2).contiguous().to(device, torch.float32)
-            result = vosr2_upscale_one_step(
-                img, scale, model["dinov2"], model["vae"], model["dit"],
-                model["args"], device, color_alignment
+    def upscale(self, model, settings, images, scale=1.0, seed=0,
+                noise_scale=1.0, auto_expand_vae_tile=True,
+                batch_override=0, **kwargs):
+        return super().upscale(
+            model, settings, images, scale, seed, noise_scale,
+        )
+
+
+NODE_CLASS_MAPPINGS["TESpeedVOSR2Image"] = TESpeedVOSR2Image
+NODE_DISPLAY_NAME_MAPPINGS["TESpeedVOSR2Image"] = "TE-Speed VOSR2 Image"
+
+# ---------------------------------------------------------------------------
+# TESpeedVOSR2Video
+# ---------------------------------------------------------------------------
+
+
+class TESpeedVOSR2Video(_VOSR2Base):
+    """Upscale video frames with VOSR2 and temporal DINO caching."""
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        parent = super().INPUT_TYPES()
+        parent["optional"]["effective_frame_batch"] = ("INT", {"default": 1, "min": 1, "max": 64, "step": 1})
+        parent["optional"]["auto_expand_vae_tile"] = ("BOOLEAN", {"default": True})
+        return parent
+
+    def upscale(self, model, settings, images, scale=1.0, seed=0,
+                noise_scale=1.0, effective_frame_batch=1,
+                auto_expand_vae_tile=True, **kwargs):
+        n = settings.normalized()
+
+        # Override frame batch if specified
+        if effective_frame_batch > 1:
+            n = VOSR2Settings(
+                quality_profile=n.quality_profile,
+                tile_size=n.tile_size,
+                tile_overlap=n.tile_overlap,
+                tile_strategy=n.tile_strategy,
+                vae_tile_size=n.vae_tile_size,
+                vae_tile_overlap=n.vae_tile_overlap,
+                memory_policy=n.memory_policy,
+                image_batch=n.image_batch,
+                frame_batch=effective_frame_batch,
+                dino_batch=n.dino_batch,
+                color_alignment=n.color_alignment,
+                full_frame=n.full_frame,
+                temporal_cache=n.temporal_cache,
+                cache_refresh=n.cache_refresh,
+                cache_threshold=n.cache_threshold,
             )
-            frames_out.append(result.permute(0, 2, 3, 1).cpu())
-            mm.soft_empty_cache()
-        return (torch.cat(frames_out, dim=0).to(torch.float32),)
+
+        model.set_memory_policy(n.memory_policy)
+
+        output, _ = inference.run_vosr2(
+            model=model,
+            images=images,
+            settings=n,
+            scale=scale,
+            seed=seed,
+            noise_scale=noise_scale,
+            enable_timing=False,
+        )
+        return (output,)
 
 
-# ── Registration ─────────────────────────────────────────────────
-NODE_CLASS_MAPPINGS = {
-    "TESpeedVOSR2Settings": TESpeedVOSR2Settings,
-    "TESpeedVOSR2Loader": TESpeedVOSR2Loader,
-    "TESpeedVOSR2Image": TESpeedVOSR2Image,
-    "TESpeedVOSR2Video": TESpeedVOSR2Video,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "TESpeedVOSR2Settings": "VOSR2 Settings (Linux)",
-    "TESpeedVOSR2Loader": "VOSR2 Model Loader (Linux)",
-    "TESpeedVOSR2Image": "VOSR2 Image Upscale (Linux)",
-    "TESpeedVOSR2Video": "VOSR2 Video Upscale (Linux)",
-}
+NODE_CLASS_MAPPINGS["TESpeedVOSR2Video"] = TESpeedVOSR2Video
+NODE_DISPLAY_NAME_MAPPINGS["TESpeedVOSR2Video"] = "TE-Speed VOSR2 Video Frames"
